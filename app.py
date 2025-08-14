@@ -418,193 +418,31 @@ agent_executor = AgentExecutor(
     return_intermediate_steps=False
 )
 
-
-from fastapi import Request, HTTPException
+from fastapi import FastAPI, Request, UploadFile, HTTPException, File, Form
 from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
+from typing import List, Dict
 from io import BytesIO
+import tempfile, json, re
 import pandas as pd
-import numpy as np
+import concurrent.futures
+import logging
 
-from fastapi import Request, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from io import BytesIO, StringIO
-import tempfile, json
-import pandas as pd
+app = FastAPI()
+logger = logging.getLogger("api_logger")
 
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
-from io import BytesIO
-import pandas as pd
-import numpy as np
+LLM_TIMEOUT_SECONDS = 60  # adjust as needed
 
-@app.post("/api")
-async def analyze_data(request: Request):
-    try:
-        form = await request.form()
-
-        # Collect all uploaded files from the form
-        uploads = []
-        for _, value in form.multi_items():
-            if isinstance(value, UploadFile):
-                uploads.append(value)
-
-        if not uploads:
-            raise HTTPException(400, "Upload at least one file (.txt questions file is required).")
-
-        # Find exactly one .txt as questions file
-        txt_files = [f for f in uploads if (f.filename or "").lower().endswith(".txt")]
-        if len(txt_files) != 1:
-            raise HTTPException(400, "Exactly one .txt questions file is required.")
-        questions_file = txt_files[0]
-        raw_questions = (await questions_file.read()).decode("utf-8")
-
-
-        type_map = {}
-        patterns = [
-            re.compile(r"^\s*-\s*`([^`]+)`\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list with backticks
-            re.compile(r"^\s*-\s*([a-zA-Z0-9_]+)\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list no backticks
-            re.compile(r"`([^`]+)`\s*\((number|string|boolean|base64)[s]?\)", re.IGNORECASE),  # inline (type)
-        ]
-
-        for pat in patterns:
-            for match in pat.finditer(raw_questions):
-                key, type_hint = match.groups()
-                norm_type = type_hint.strip().lower()
-                if norm_type in ("number", "float", "int"):
-                    norm_type = "number"
-                elif norm_type in ("string", "str"):
-                    norm_type = "string"
-                elif "base64" in norm_type:
-                    norm_type = "base64"
-                elif norm_type in ("bool", "boolean"):
-                    norm_type = "boolean"
-                type_map[key.strip()] = norm_type
-
-        # Build type note for LLM prompt
-        type_note = "\nNote: The following are the exact expected types for each key based on the questions file:\n"
-        if type_map:
-            for k, t in type_map.items():
-                type_note += f"- {k}: {t}\n"
-        else:
-            type_note += "(No explicit types detected in questions file)\n"
-
-        # All others are candidate datasets
-        data_candidates = [f for f in uploads if f is not questions_file]
-
-        pickle_path = None
-        df_preview = ""
-        dataset_uploaded = False
-
-        # Try to parse the first valid dataset
-        for data_file in data_candidates:
-            filename = (data_file.filename or "").lower()
-            content = await data_file.read()
-
-            try:
-                if filename.endswith(".csv"):
-                    df = pd.read_csv(BytesIO(content))
-                elif filename.endswith((".xlsx", ".xls")):
-                    df = pd.read_excel(BytesIO(content))
-                elif filename.endswith(".parquet"):
-                    df = pd.read_parquet(BytesIO(content))
-                elif filename.endswith(".json"):
-                    try:
-                        df = pd.read_json(BytesIO(content))
-                    except ValueError:
-                        df = pd.DataFrame(json.loads(content.decode("utf-8")))
-                elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
-                    try:
-                        if PIL_AVAILABLE:
-                            image = Image.open(BytesIO(content))
-                            image = image.convert("RGB")  # ensure RGB format
-                            df = pd.DataFrame({"image": [image]})  # store as a single column DataFrame
-                        else:
-                            raise ValueError("PIL is not available for image processing.")
-                    except Exception as e:
-                        raise ValueError(f"Failed to process image file: {str(e)}")
-                else:
-                    continue  # unsupported type
-            except Exception:
-                continue  # failed parse
-
-            # If parsed successfully
-            dataset_uploaded = True
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
-
-            df_preview = (
-                f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
-                f"Columns: {', '.join(df.columns.astype(str))}\n"
-                f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
-            )
-            break  # only the first valid dataset is used
-
-        # Build LLM rules
-        if dataset_uploaded:
-            llm_rules = (
-                "Rules:\n"
-                "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
-                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
-                "3) Use only the uploaded dataset for answering questions.\n"
-                "4) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
-            )
-        else:
-            llm_rules = (
-                "Rules:\n"
-                "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
-                "2) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
-            )
-
-        llm_input = (
-            f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}\n"
-            f"{type_note}\n"
-            "Respond with the JSON object only."
-        )
-
-        # Run unified agent
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as ex:
-            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, type_map)
-            try:
-                result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError:
-                raise HTTPException(408, "Processing timeout")
-
-        if "error" in result:
-            raise HTTPException(500, detail=result["error"])
-
-        return JSONResponse(content=result)
-
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.exception("analyze_data failed")
-        raise HTTPException(500, detail=str(e))
-
+PIL_AVAILABLE = False
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    pass
 
 # -----------------------------
-# Runner: orchestrates agent -> pre-scrape inject -> execute
+# Unified Agent Runner
 # -----------------------------
-    
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: dict = None) -> Dict:
-    """
-    Runs the LLM agent and executes code.
-    - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
-    """
     try:
         response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
         raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
@@ -621,7 +459,7 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: 
         code = parsed["code"]
         questions = parsed["questions"]
 
-        # If no pickle provided, check if code tries to scrape
+        # Handle scraping if no pickle provided
         if pickle_path is None:
             urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
             if urls:
@@ -635,13 +473,14 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: 
                 df.to_pickle(temp_pkl.name)
                 pickle_path = temp_pkl.name
 
-        # Execute code with pickle injection if available
+        # Execute agent code
         exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
         if exec_result.get("status") != "success":
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
 
         results_dict = exec_result.get("result", {})
-        print(f"Results dict: {results_dict}")
+
+        # Enforce type_map
         if type_map:
             for k, expected in type_map.items():
                 if k not in results_dict:
@@ -656,13 +495,140 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: 
                 elif expected in ("string", "base64"):
                     results_dict[k] = "" if v is None else str(v)
                 elif expected == "boolean":
-                    results_dict[k] = bool(v)  
+                    results_dict[k] = bool(v)
+
         return results_dict
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
-    
+
+
+# -----------------------------
+# /api endpoint
+# -----------------------------
+@app.post("/api")
+async def analyze_data(request: Request):
+    try:
+        form = await request.form()
+
+        # Collect uploaded files
+        uploads = [v for _, v in form.multi_items() if isinstance(v, UploadFile)]
+        if not uploads:
+            return JSONResponse(content={"error": "Upload at least one file (.txt questions file required)"})
+
+        # Find exactly one .txt questions file
+        txt_files = [f for f in uploads if (f.filename or "").lower().endswith(".txt")]
+        if len(txt_files) != 1:
+            return JSONResponse(content={"error": "Exactly one .txt questions file is required"})
+        questions_file = txt_files[0]
+        raw_questions = (await questions_file.read()).decode("utf-8")
+
+        # Extract type hints
+        type_map = {}
+        patterns = [
+            re.compile(r"^\s*-\s*`([^`]+)`\s*:\s*([a-zA-Z ]+)", re.MULTILINE),
+            re.compile(r"^\s*-\s*([a-zA-Z0-9_]+)\s*:\s*([a-zA-Z ]+)", re.MULTILINE),
+            re.compile(r"`([^`]+)`\s*\((number|string|boolean|base64)[s]?\)", re.IGNORECASE),
+        ]
+        for pat in patterns:
+            for match in pat.finditer(raw_questions):
+                key, type_hint = match.groups()
+                norm_type = type_hint.strip().lower()
+                if norm_type in ("number", "float", "int"):
+                    norm_type = "number"
+                elif norm_type in ("string", "str"):
+                    norm_type = "string"
+                elif "base64" in norm_type:
+                    norm_type = "base64"
+                elif norm_type in ("bool", "boolean"):
+                    norm_type = "boolean"
+                type_map[key.strip()] = norm_type
+
+        # Prepare type note for agent prompt
+        type_note = "\nNote: Expected types:\n"
+        if type_map:
+            for k, t in type_map.items():
+                type_note += f"- {k}: {t}\n"
+        else:
+            type_note += "(No explicit types detected)\n"
+
+        # Candidate dataset files
+        data_candidates = [f for f in uploads if f is not questions_file]
+        pickle_path = None
+        df_preview = ""
+        dataset_uploaded = False
+
+        # Parse the first dataset
+        for data_file in data_candidates:
+            filename = (data_file.filename or "").lower()
+            content = await data_file.read()
+            try:
+                if filename.endswith(".csv"):
+                    df = pd.read_csv(BytesIO(content))
+                elif filename.endswith((".xlsx", ".xls")):
+                    df = pd.read_excel(BytesIO(content))
+                elif filename.endswith(".parquet"):
+                    df = pd.read_parquet(BytesIO(content))
+                elif filename.endswith(".json"):
+                    try:
+                        df = pd.read_json(BytesIO(content))
+                    except:
+                        df = pd.DataFrame(json.loads(content.decode("utf-8")))
+                elif filename.endswith((".png", ".jpg", ".jpeg")) and PIL_AVAILABLE:
+                    from PIL import Image
+                    image = Image.open(BytesIO(content)).convert("RGB")
+                    df = pd.DataFrame({"image": [image]})
+                else:
+                    continue
+            except Exception:
+                continue
+
+            dataset_uploaded = True
+            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            temp_pkl.close()
+            df.to_pickle(temp_pkl.name)
+            pickle_path = temp_pkl.name
+            df_preview = f"\nDataset: {len(df)} rows, {len(df.columns)} columns\nColumns: {', '.join(df.columns.astype(str))}\n"
+            break
+
+        # Build agent prompt
+        if dataset_uploaded:
+            llm_rules = (
+                "Rules:\n"
+                "1) Use the uploaded dataset only, available as `df` and `data`.\n"
+                "2) Do not scrape external data.\n"
+                "3) Return JSON with keys: 'questions' and 'code'.\n"
+                "4) Use plot_to_base64() for plots.\n"
+            )
+        else:
+            llm_rules = (
+                "Rules:\n"
+                "1) You may call scrape_url_to_dataframe(url) if needed.\n"
+                "2) Return JSON with keys: 'questions' and 'code'.\n"
+                "3) Use plot_to_base64() for plots.\n"
+            )
+
+        llm_input = f"{llm_rules}\nQuestions:\n{raw_questions}\n{df_preview}\n{type_note}\nRespond with JSON only."
+
+        # Run agent with timeout
+        with concurrent.futures.ThreadPoolExecutor() as ex:
+            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, type_map)
+            try:
+                result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                return JSONResponse(content={"error": "Processing timeout"})
+
+        if "error" in result:
+            return JSONResponse(content={"error": result["error"]})
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        logger.exception("analyze_data failed")
+        return JSONResponse(content={"error": str(e)})
+
+
 from fastapi.responses import FileResponse, Response
 import base64, os
 
@@ -693,5 +659,7 @@ async def analyze_get_info():
 
 if __name__ == "__main__":
     import uvicorn
+    import logging
+    logging.basicConfig(level=logging.INFO)
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
