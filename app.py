@@ -334,7 +334,6 @@ def plot_to_base64(max_bytes=100000):
     script_lines.append(code)
     # ensure results printed as json
     script_lines.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
-
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
     tmp.write("\n".join(script_lines))
     tmp.flush()
